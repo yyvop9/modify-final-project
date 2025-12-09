@@ -1,0 +1,189 @@
+version: '3.9'
+
+services:
+  # 1. Database (PostgreSQL with pgvector)
+  postgres:
+    image: pgvector/pgvector:0.6.0-pg16
+    container_name: modify-postgres
+    restart: always
+    environment:
+      POSTGRES_USER: modify_user
+      POSTGRES_PASSWORD: modify_password
+      POSTGRES_DB: modify_db
+      TZ: Asia/Seoul
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U modify_user -d modify_db"] 
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - modify-network
+
+  # 2. Cache & Broker (Redis)
+  redis:
+    image: redis:7.2-alpine
+    container_name: modify-redis
+    restart: always
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru --appendonly yes
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - modify-network
+
+  # 3. Backend API (FastAPI)
+  backend-core:
+    build:
+      context: ./backend-core
+      dockerfile: Dockerfile
+    container_name: modify-backend
+    restart: always
+    ports:
+      - "8000:8000"
+    command: uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
+    env_file:
+      - .env.dev
+    environment:
+      - WATCHFILES_FORCE_POLLING=true
+    volumes:
+      - ./backend-core:/app 
+      - ./.env.dev:/app/.env.dev
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - modify-network
+
+  # 4. Backend Worker
+  celery-worker:
+    build:
+      context: ./backend-core
+      dockerfile: Dockerfile
+    container_name: modify-celery-worker
+    restart: always
+    command: celery -A src.core.celery_app worker --loglevel=info
+    env_file:
+      - .env.dev
+    volumes:
+      - ./backend-core:/app
+      - ./.env.dev:/app/.env.dev
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - modify-network     
+      
+  # 5. AI Service API (수정됨)
+  ai-service-api: 
+    build:
+      context: ./ai-service
+      dockerfile: Dockerfile
+    container_name: modify-ai-api
+    restart: always
+    command: uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8005:8000"
+    
+    # ✅ [1] 파일에서 변수를 읽어오도록 설정 (이것만 있으면 됩니다!)
+    env_file:
+      - .env.dev
+      
+    # ✅ [2] environment 섹션에서 WATSONX 관련 내용 삭제
+    # (이미 env_file에서 읽었는데, 여기서 ${}로 다시 부르면 빈 값으로 덮어써집니다)
+    environment:
+      - WATCHFILES_FORCE_POLLING=true
+      - EMBEDDING_DEVICE=cpu
+      # ❌ 삭제함: - WATSONX_API_KEY=${WATSONX_API_KEY} 
+      # ❌ 삭제함: - WATSONX_PROJECT_ID=${WATSONX_PROJECT_ID}
+      # ❌ 삭제함: - WATSONX_URL=${WATSONX_URL}
+
+    volumes:
+      - ./ai-service:/app 
+      - model_cache:/app/models_cache
+    networks:
+      - modify-network
+
+  # 6. AI Worker (수정됨)
+  ai-service-worker: 
+    build:
+      context: ./ai-service
+      dockerfile: Dockerfile
+    container_name: modify-ai-worker
+    restart: always
+    command: celery -A src.worker.celery_app worker --loglevel=info --concurrency=2
+    
+    # ✅ [1] 워커도 똑같이 파일만 의존
+    env_file:
+      - .env.dev
+      
+    # ✅ [2] 여기서도 WATSONX 관련 변수 삭제 (덮어쓰기 방지)
+    environment:
+      - EMBEDDING_DEVICE=cpu
+      # ❌ 삭제함: WATSONX 관련 변수들...
+
+    volumes:
+      - ./ai-service:/app 
+      - model_cache:/app/models_cache
+    depends_on:
+      redis:
+        condition: service_healthy
+      ai-service-api:
+        condition: service_started
+    networks:
+      - modify-network
+
+  
+
+  # 7. Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: modify-frontend
+    env_file:
+      - .env.dev
+    volumes:
+      - ./frontend:/app 
+      - /app/node_modules
+    command: npm run dev -- --host 0.0.0.0 
+    ports:
+      - "5173:5173"
+    networks:
+      - modify-network
+    depends_on:
+      - backend-core
+      
+  # 8. Nginx
+  nginx-proxy:
+    image: nginx:stable-alpine
+    container_name: modify-nginx-proxy
+    volumes:
+      - ./Deploy/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "80:80"
+    depends_on:
+      - frontend
+      - backend-core
+    networks:
+      - modify-network
+
+volumes:
+  postgres_data:
+  model_cache:
+
+networks:
+  modify-network:
+    driver: bridge
